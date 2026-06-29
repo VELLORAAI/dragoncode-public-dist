@@ -6,7 +6,7 @@ auto-indexes your repo for whole-codebase retrieval, and compacts context early.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/VELLORAAI/dragoncode/main/install | bash
+curl -fsSL https://raw.githubusercontent.com/VELLORAAI/dragoncode-public-dist/main/install | bash
 ```
 
 Then:
@@ -15,4 +15,4 @@ Then:
 dragon            # paste your MWS API key when prompted → done
 ```
 
-Binaries are published on this repo's [Releases](https://github.com/VELLORAAI/dragoncode/releases).
+Binaries are published on this repo's [Releases](https://github.com/VELLORAAI/dragoncode-public-dist/releases).
