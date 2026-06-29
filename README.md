@@ -9,7 +9,7 @@ auto-indexes your repo for whole-codebase retrieval, and compacts context early.
 curl -fsSL https://raw.githubusercontent.com/VELLORAAI/dragoncode-public-dist/main/install | bash
 ```
 
-Then:
+Then **open a new terminal** (or run `source ~/.zshrc`) so `dragon` is on your PATH, and run it with no arguments:
 
 ```sh
 dragon            # paste your MWS API key when prompted → done
