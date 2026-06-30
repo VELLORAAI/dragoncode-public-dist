@@ -463,6 +463,23 @@ echo -e ""
 echo -e "cd <project>  ${MUTED}# Open directory${NC}"
 echo -e "dragon        ${MUTED}# Run command${NC}"
 echo -e ""
+
+# The PATH export was written to a shell config file, but this installer runs in a
+# subshell (curl ... | bash) and cannot update the PATH of the interactive shell that
+# launched it. Tell the user how to pick it up now. `command -v dragon` is the signal:
+# it fails exactly when a reload is needed, and succeeds on reinstall / already-on-PATH.
+if { [ -z "${GITHUB_ACTIONS-}" ] || [ "${GITHUB_ACTIONS}" != "true" ]; } \
+   && ! command -v dragon >/dev/null 2>&1; then
+    if [ -n "${config_file:-}" ]; then
+        echo -e "${ORANGE}dragon isn't on your PATH in this shell yet.${NC} Open a new terminal, or run:"
+        echo -e "    source $config_file"
+    else
+        echo -e "${ORANGE}Add dragon to your PATH:${NC}"
+        echo -e "    export PATH=$INSTALL_DIR:\$PATH"
+    fi
+    echo -e ""
+fi
+
 echo -e "${MUTED}For more information visit ${NC}https://github.com/VELLORAAI/dragoncode-public-dist"
 echo -e ""
 echo -e ""
