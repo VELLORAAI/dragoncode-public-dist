@@ -23,9 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest   # linux-x64 (glibc)
-          - os: macos-14        # darwin-arm64 (Apple Silicon)
-          - os: macos-13        # darwin-x64 (Intel)
+          - os: ubuntu-latest    # linux-x64 (glibc)
+          - os: ubuntu-24.04-arm # linux-arm64 (the 5th shipped platform)
+          - os: macos-14         # darwin-arm64 (Apple Silicon)
+          - os: macos-13         # darwin-x64 (Intel)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
