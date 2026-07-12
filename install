@@ -190,7 +190,7 @@ else
     fi
 
     if [ -z "$requested_version" ]; then
-        url="https://github.com/VELLORAAI/dragoncode-public-dist/releases/latest/download/$filename"
+        release_base="https://github.com/VELLORAAI/dragoncode-public-dist/releases/latest/download"
         specific_version=$(curl -s https://api.github.com/repos/VELLORAAI/dragoncode-public-dist/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
 
         if [[ $? -ne 0 || -z "$specific_version" ]]; then
@@ -200,7 +200,7 @@ else
     else
         # Strip leading 'v' if present
         requested_version="${requested_version#v}"
-        url="https://github.com/VELLORAAI/dragoncode-public-dist/releases/download/v${requested_version}/$filename"
+        release_base="https://github.com/VELLORAAI/dragoncode-public-dist/releases/download/v${requested_version}"
         specific_version=$requested_version
 
         # Verify the release exists before downloading
@@ -211,6 +211,38 @@ else
             exit 1
         fi
     fi
+
+    # Resolve the actual asset. We may have appended a -baseline (older x86-64,
+    # no AVX2) or -musl (Alpine) suffix above, but those variants are not always
+    # published. Probe the optimized asset first and fall back to the plain
+    # "$os-$arch" build so an older CPU / musl libc gets a clean warning and a
+    # working binary instead of a hard 404. Candidates are tried in preference
+    # order; the first that exists wins.
+    plain_filename="$APP-$os-$arch$archive_ext"
+    asset_exists() {
+        # A published GitHub release asset resolves (302) to a CDN URL; a missing
+        # one returns 404. -L follows the redirect so we observe the final 200.
+        local code
+        code=$(curl -sIL -o /dev/null -w "%{http_code}" "$1" 2>/dev/null || echo 000)
+        [ "$code" = "200" ]
+    }
+    resolved=""
+    for candidate in "$filename" "$plain_filename"; do
+        if asset_exists "$release_base/$candidate"; then
+            resolved="$candidate"
+            break
+        fi
+    done
+    if [ -z "$resolved" ]; then
+        echo -e "${RED}Error: no matching release asset for $os-$arch (tried: $filename${NC}$([ "$plain_filename" != "$filename" ] && echo ", $plain_filename")${RED})${NC}"
+        echo -e "${MUTED}Available assets: https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}"
+        exit 1
+    fi
+    if [ "$resolved" != "$filename" ]; then
+        echo -e "${ORANGE}Note: an optimized build ($filename) isn't published for your CPU/libc; using the standard build ($resolved). It requires a modern x86-64 CPU (AVX2) and glibc.${NC}" >&2
+        filename="$resolved"
+    fi
+    url="$release_base/$filename"
 fi
 
 print_message() {

@@ -1,0 +1,100 @@
+name: install-smoke
+
+# Proves the installer actually lands a runnable `dragon` on every supported OS.
+# Runs the PR's own install scripts (not the copy on main) so installer changes
+# are validated before merge. The published release assets are public, so no
+# secrets are needed. Also asserts the -baseline/-musl fallback resolves a real
+# asset instead of 404ing on older-CPU / musl hosts.
+
+on:
+  push:
+    branches: [main]
+    paths: [install, install.ps1, .github/workflows/install-smoke.yml]
+  pull_request:
+    paths: [install, install.ps1, .github/workflows/install-smoke.yml]
+  schedule:
+    - cron: "37 7 * * 1" # weekly: catch a release that broke an OS's asset
+  workflow_dispatch:
+
+jobs:
+  posix:
+    name: bash install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest   # linux-x64 (glibc)
+          - os: macos-14        # darwin-arm64 (Apple Silicon)
+          - os: macos-13        # darwin-x64 (Intel)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install via the local bash script
+        run: bash ./install
+      - name: Binary runs and reports a version
+        run: |
+          set -euo pipefail
+          bin="$HOME/.dragoncode/bin/dragon"
+          test -x "$bin" || { echo "installer did not produce $bin"; exit 1; }
+          ver="$("$bin" --version 2>&1 | tr -d '\r')"
+          echo "dragon --version => $ver"
+          test -n "$ver" || { echo "empty version output"; exit 1; }
+
+  windows-bash:
+    name: bash install (Git Bash on Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install via the local bash script (MSYS/Git Bash)
+        run: bash ./install
+      - name: dragon.exe runs and reports a version
+        run: |
+          set -euo pipefail
+          bin="$HOME/.dragoncode/bin/dragon.exe"
+          test -f "$bin" || { echo "installer did not produce $bin"; ls -la "$HOME/.dragoncode/bin" || true; exit 1; }
+          ver="$("$bin" --version 2>&1 | tr -d '\r')"
+          echo "dragon --version => $ver"
+          test -n "$ver" || { echo "empty version output"; exit 1; }
+
+  windows-native:
+    name: PowerShell install.ps1 (native Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install via install.ps1
+        run: ./install.ps1
+      - name: dragon.exe runs and reports a version
+        run: |
+          $bin = Join-Path $HOME '.dragoncode\bin\dragon.exe'
+          if (-not (Test-Path $bin)) { throw "installer did not produce $bin" }
+          $ver = (& $bin --version) -join "`n"
+          Write-Host "dragon --version => $ver"
+          if ([string]::IsNullOrWhiteSpace($ver)) { throw "empty version output" }
+
+  fallback-resolution:
+    name: -baseline/-musl asset fallback resolves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: A missing optimized asset falls back to the plain target
+        run: |
+          set -euo pipefail
+          base="https://github.com/VELLORAAI/dragoncode-public-dist/releases/latest/download"
+          probe() { curl -sIL -o /dev/null -w "%{http_code}" "$1" 2>/dev/null || echo 000; }
+          # The optimized variants are not published; the plain targets are.
+          for missing in dragon-linux-x64-baseline.tar.gz dragon-linux-x64-musl.tar.gz; do
+            code="$(probe "$base/$missing")"
+            echo "$missing => $code (expected 404)"
+            test "$code" = "404" || { echo "unexpected: $missing now exists — update the installer fallback"; exit 1; }
+          done
+          for plain in dragon-linux-x64.tar.gz dragon-darwin-x64.zip dragon-windows-x64.zip; do
+            code="$(probe "$base/$plain")"
+            echo "$plain => $code (expected 200)"
+            test "$code" = "200" || { echo "fallback target $plain is missing from latest release"; exit 1; }
+          done
