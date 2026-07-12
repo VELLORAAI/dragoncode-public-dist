@@ -333,6 +333,59 @@ download_with_progress() {
     return $ret
 }
 
+# Verify a downloaded archive against the SHA256 digest GitHub publishes for the
+# release asset (best-effort supply-chain integrity on top of TLS). A genuine
+# mismatch ALWAYS aborts. When the tools to check are absent (no sha256sum/shasum,
+# or neither jq nor python3 to read the API, or the API is unreachable) it warns
+# and continues rather than breaking installs in minimal environments.
+verify_checksum() {
+    local file="$1" fname="$2" version="$3"
+
+    local sha_tool=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha_tool="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        sha_tool="shasum -a 256"
+    fi
+    if [ -z "$sha_tool" ]; then
+        print_message warning "No sha256 tool (sha256sum/shasum) found; skipping checksum verification."
+        return 0
+    fi
+
+    local api="https://api.github.com/repos/VELLORAAI/dragoncode-public-dist/releases/tags/v${version}"
+    local json expected=""
+    json=$(curl -fsSL "$api" 2>/dev/null) || json=""
+    if [ -n "$json" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            expected=$(printf '%s' "$json" | jq -r --arg n "$fname" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null | sed 's/^sha256://')
+        elif command -v python3 >/dev/null 2>&1; then
+            expected=$(printf '%s' "$json" | python3 -c 'import sys, json
+try:
+    data = json.load(sys.stdin)
+    name = sys.argv[1]
+    for a in data.get("assets", []):
+        if a.get("name") == name:
+            print((a.get("digest") or "").replace("sha256:", ""))
+            break
+except Exception:
+    pass' "$fname" 2>/dev/null)
+        fi
+    fi
+    if [ -z "$expected" ]; then
+        print_message warning "Could not fetch the expected checksum for ${fname}; skipping verification."
+        return 0
+    fi
+
+    local actual
+    actual=$($sha_tool "$file" 2>/dev/null | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        print_message error "Checksum mismatch for ${fname} - aborting install (possible corrupted or tampered download).\n  expected: sha256:${expected}\n  actual:   sha256:${actual}"
+        rm -rf "$(dirname "$file")"
+        exit 1
+    fi
+    print_message info "${MUTED}Verified checksum (sha256).${NC}"
+}
+
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}DragonCode ${MUTED}version: ${NC}$specific_version"
     local tmp_dir="${TMPDIR:-/tmp}/dragon_install_$$"
@@ -342,6 +395,9 @@ download_and_install() {
         # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
         curl -# -L -o "$tmp_dir/$filename" "$url"
     fi
+
+    # Integrity gate before we extract and run anything from the archive.
+    verify_checksum "$tmp_dir/$filename" "$filename" "$specific_version"
 
     if [ "$os" = "linux" ]; then
         tar -xzf "$tmp_dir/$filename" -C "$tmp_dir"
