@@ -1,0 +1,55 @@
+name: install-smoke
+
+# Proves the "runs on any OS" claim continuously: on every change to the install
+# scripts (and daily), run the ACTUAL checked-out installer on each platform the
+# product ships a binary for, then confirm `dragon --version` works. Release assets
+# are public, so no secrets are needed. If a release is mid-publish the latest-tag
+# resolution can briefly 404 — the daily schedule re-checks, and PR runs test the
+# script logic against whatever the current Latest release is.
+
+on:
+  push:
+    branches: [main]
+    paths: ["install", "install.ps1", ".github/workflows/install-smoke.yml"]
+  pull_request:
+    paths: ["install", "install.ps1", ".github/workflows/install-smoke.yml"]
+  schedule:
+    - cron: "37 6 * * *" # daily: catches a release that shipped an asset for only some platforms
+  workflow_dispatch:
+
+jobs:
+  posix:
+    name: install (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, label: linux-x64 }
+          - { os: macos-14, label: macos-arm64 }
+          - { os: macos-13, label: macos-intel-x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the checked-out installer (latest release)
+        run: bash ./install
+      - name: dragon --version resolves on PATH
+        run: |
+          echo "$HOME/.dragoncode/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.dragoncode/bin:$PATH"
+          which dragon
+          dragon --version
+
+  windows:
+    name: install (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the checked-out PowerShell installer (latest release)
+        shell: pwsh
+        run: ./install.ps1
+      - name: dragon.exe --version resolves
+        shell: pwsh
+        run: |
+          $bin = Join-Path $HOME '.dragoncode\bin'
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path $bin 'dragon.exe') --version
