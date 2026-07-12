@@ -386,10 +386,37 @@ except Exception:
     print_message info "${MUTED}Verified checksum (sha256).${NC}"
 }
 
+# Preflight the resolved asset URL. musl (Alpine) and baseline (pre-AVX2 x64)
+# targets get a `-musl` / `-baseline` suffix, but those variants are not published
+# yet — without this the download 404 would be saved as an HTML body and then fail
+# cryptically in tar/unzip ("not in gzip format"). A HEAD check lets us give an
+# honest, variant-aware message instead. We do NOT silently fall back to the plain
+# build: a glibc binary will not run on musl, and the AVX2 build can crash with an
+# illegal-instruction fault on a pre-AVX2 CPU.
+preflight_asset() {
+    local url="$1" filename="$2"
+    local status
+    status=$(curl -sIL -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+    [ "$status" != "404" ] && return 0
+    case "$filename" in
+        *-musl.*)
+            print_message error "No musl build of DragonCode is published for '${target}' yet.\n  ${MUTED}Alpine/musl systems need a dedicated musl binary; the glibc build will not run.\n  Please install on a glibc distro, or track/request it at:\n  https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}" ;;
+        *-baseline.*)
+            print_message error "No baseline (pre-AVX2) build of DragonCode is published for '${target}' yet.\n  ${MUTED}This CPU lacks AVX2; the standard build can fault with an illegal instruction.\n  Track/request it at:\n  https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}" ;;
+        *)
+            print_message error "Release asset not found: ${filename}\n  ${MUTED}${url}\n  See https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}" ;;
+    esac
+    exit 1
+}
+
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}DragonCode ${MUTED}version: ${NC}$specific_version"
     local tmp_dir="${TMPDIR:-/tmp}/dragon_install_$$"
     mkdir -p "$tmp_dir"
+
+    # Clear message for the not-yet-published musl/baseline variants before we
+    # download a 404 body that would break extraction downstream.
+    preflight_asset "$url" "$filename"
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url" "$tmp_dir/$filename"; then
         # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
