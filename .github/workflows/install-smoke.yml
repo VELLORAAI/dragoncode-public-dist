@@ -3,9 +3,15 @@ name: install-smoke
 # Proves the "runs on any OS" claim continuously: on every change to the install
 # scripts (and daily), run the ACTUAL checked-out installer on each platform the
 # product ships a binary for, then confirm `dragon --version` works. Release assets
-# are public, so no secrets are needed. If a release is mid-publish the latest-tag
-# resolution can briefly 404 — the daily schedule re-checks, and PR runs test the
-# script logic against whatever the current Latest release is.
+# are public, so no secrets are needed.
+#
+# The version is resolved ONCE via the authenticated GitHub token and pinned across
+# the matrix. The installers' default "latest" path resolves the tag through
+# unauthenticated api.github.com (60 req/hr/IP), which the shared-NAT macOS runners
+# routinely exhaust ("Failed to fetch version information"); pinning sidesteps that
+# rate limit while still testing the current Latest release on every OS. The
+# download itself comes from github.com release assets (not rate-limited), and the
+# installer's SHA256 step fail-opens if its API call is throttled.
 
 on:
   push:
@@ -18,8 +24,24 @@ on:
   workflow_dispatch:
 
 jobs:
+  resolve:
+    name: resolve latest version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Resolve the current Latest release tag (authenticated)
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest release: ${tag}"
+
   posix:
     name: install (${{ matrix.label }})
+    needs: resolve
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -30,8 +52,8 @@ jobs:
           - { os: macos-13, label: macos-intel-x64 }
     steps:
       - uses: actions/checkout@v4
-      - name: Run the checked-out installer (latest release)
-        run: bash ./install
+      - name: Run the checked-out installer (pinned to latest)
+        run: bash ./install --version "${{ needs.resolve.outputs.version }}"
       - name: dragon --version resolves on PATH
         run: |
           echo "$HOME/.dragoncode/bin" >> "$GITHUB_PATH"
@@ -41,12 +63,13 @@ jobs:
 
   windows:
     name: install (windows-x64)
+    needs: resolve
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run the checked-out PowerShell installer (latest release)
+      - name: Run the checked-out PowerShell installer (pinned to latest)
         shell: pwsh
-        run: ./install.ps1
+        run: ./install.ps1 -Version "${{ needs.resolve.outputs.version }}"
       - name: dragon.exe --version resolves
         shell: pwsh
         run: |
