@@ -82,12 +82,28 @@ Copy-Item -Path $exe -Destination (Join-Path $InstallDir 'dragon.exe') -Force
 Remove-Item -Recurse -Force $tmp
 
 # --- PATH ------------------------------------------------------------------
+# Known trade-off: SetEnvironmentVariable rewrites the User value as REG_SZ,
+# so pre-existing REG_EXPAND_SZ entries (e.g. %USERPROFILE%\bin) stop
+# expanding. We only ever prepend one literal path.
 if (-not $NoModifyPath) {
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (-not $userPath) { $userPath = '' }
   if (($userPath -split ';') -notcontains $InstallDir) {
     [Environment]::SetEnvironmentVariable('Path', ($InstallDir + ';' + $userPath).TrimEnd(';'), 'User')
     Write-Info "Added $InstallDir to your user PATH."
+
+    # Broadcast WM_SETTINGCHANGE so already-running shells (Explorer, Windows
+    # Terminal) hand the new PATH to processes they spawn; without this, only
+    # terminals started after a fresh login see the entry. Best effort.
+    try {
+      $sig = '[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)] public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);'
+      $smto = Add-Type -MemberDefinition $sig -Name 'SendMessageTimeout' -Namespace 'DragonInstall' -PassThru
+      [System.UIntPtr]$broadcastResult = [System.UIntPtr]::Zero
+      # 0xffff = HWND_BROADCAST, 0x001A = WM_SETTINGCHANGE, 2 = SMTO_ABORTIFHUNG
+      $null = $smto::SendMessageTimeout([System.IntPtr]0xffff, 0x001A, [System.UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$broadcastResult)
+    } catch {
+      # Non-fatal: a brand-new terminal still picks the PATH up.
+    }
   }
   # Make it usable in the current session too.
   if (($env:Path -split ';') -notcontains $InstallDir) { $env:Path = "$InstallDir;$env:Path" }
