@@ -78,7 +78,24 @@ $exe = Join-Path $tmp 'dragon.exe'
 if (-not (Test-Path $exe)) { Fail "Archive did not contain dragon.exe" }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item -Path $exe -Destination (Join-Path $InstallDir 'dragon.exe') -Force
+
+# Place dragon.exe. On Windows you cannot overwrite a running image, so a plain
+# Copy-Item -Force fails whenever Dragon is updating itself (or any dragon is
+# open) with "the process cannot access the file because it is being used by
+# another process". Windows DOES allow renaming a running exe, so move the old
+# one aside first, then copy the new one into place. The stale .old is unlocked
+# once that process exits; sweep it best-effort now and again next run.
+$dest = Join-Path $InstallDir 'dragon.exe'
+$old = Join-Path $InstallDir 'dragon.exe.old'
+if (Test-Path $old) { try { Remove-Item -Force $old -ErrorAction Stop } catch { } }
+if (Test-Path $dest) {
+  try { Rename-Item -Path $dest -NewName 'dragon.exe.old' -Force -ErrorAction Stop }
+  catch {
+    # Rename can still fail if a prior .old is itself pinned; fall back to the
+    # in-place copy so a first-time or not-running install is never blocked.
+  }
+}
+Copy-Item -Path $exe -Destination $dest -Force
 Remove-Item -Recurse -Force $tmp
 
 # --- PATH ------------------------------------------------------------------
