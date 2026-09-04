@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+
+# This installer requires bash, and it is normally PIPED to a shell
+# (`curl … | bash`), which means the shebang above is never consulted — the
+# shell that reads stdin is whatever the caller chose. The in-product updater
+# picks `sh` whenever `bash --version` fails (installation/index.ts), so on a
+# musl/Alpine host with no bash this file can be handed to dash.
+#
+# Under dash the very next line dies with `set: Illegal option -o pipefail`,
+# and the rest of the script — [[ ]], arrays, ${var// /x}, `local` — is not
+# parseable either. That produced a cryptic failure mid-run instead of a
+# sentence anyone could act on.
+#
+# This guard is deliberately POSIX-only and deliberately FIRST: a shell reads
+# and executes complete commands as it goes, so exiting here means the
+# bash-only syntax further down is never parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "dragon: this installer requires bash, but is running under a different shell." >&2
+    if command -v bash >/dev/null 2>&1; then
+        echo "dragon: bash is installed - re-run the installer with it:" >&2
+    else
+        echo "dragon: install bash, then re-run the installer with it:" >&2
+    fi
+    echo "  curl -fsSL https://raw.githubusercontent.com/VELLORAAI/dragoncode-public-dist/main/install | bash" >&2
+    exit 1
+fi
+
 set -euo pipefail
 APP=dragon
 
@@ -29,6 +55,8 @@ EOF
 requested_version=${VERSION:-}
 no_modify_path=false
 binary_path=""
+# Set by check_version when $INSTALL_DIR already holds the requested version.
+skip_download=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -59,8 +87,14 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            echo -e "${ORANGE}Warning: Unknown option '$1'${NC}" >&2
-            shift
+            # Was a warning that shifted and carried on. In a script whose whole
+            # job is version pinning, that turned a typo into a SILENT pin
+            # failure: `--verison 1.5.61` warned twice and installed *latest*,
+            # and the only evidence was two lines of scrollback. Refuse instead.
+            echo -e "${RED}Error: unknown option '$1'${NC}" >&2
+            echo "" >&2
+            usage >&2
+            exit 1
             ;;
     esac
 done
@@ -259,20 +293,39 @@ print_message() {
     echo -e "${color}${message}${NC}"
 }
 
+# Decide whether there is anything to do, by asking the binary we are about to
+# REPLACE — not whatever `dragon` happens to be first on PATH.
+#
+# This used to run `command -v dragon` / `dragon --version`. When PATH resolved
+# a different dragon than $INSTALL_DIR — a shim, a package-manager copy, a stale
+# PATH entry, or simply a different $HOME — the installer compared against a
+# binary it was never going to touch, printed "already installed", and exited 0
+# having installed NOTHING. Reproduced: a 1.5.59 install with a 1.5.60 on PATH
+# reported success and stayed on 1.5.59. `dragon_path=$(which dragon)` was
+# assigned and never read: the vestige of the $INSTALL_DIR guard this restores.
+#
+# Returning (rather than exiting) when there is no existing install is the other
+# half: absence must mean "go install it", never "nothing to do".
 check_version() {
-    if command -v dragon >/dev/null 2>&1; then
-        dragon_path=$(which dragon)
+    local target="${INSTALL_DIR}/${bin_name}"
 
-        ## Check the installed version
-        installed_version=$(dragon --version 2>/dev/null || echo "")
+    [ -x "$target" ] || return 0
 
-        if [[ "$installed_version" != "$specific_version" ]]; then
-            print_message info "${MUTED}Installed version: ${NC}$installed_version."
-        else
-            print_message info "${MUTED}Version ${NC}$specific_version${MUTED} already installed"
-            exit 0
-        fi
+    # tr -d '\r' because the Windows binary reports with CRLF endings.
+    local installed_version
+    installed_version=$("$target" --version 2>/dev/null | tr -d '\r' || echo "")
+
+    if [ "$installed_version" != "$specific_version" ]; then
+        print_message info "${MUTED}Installed version: ${NC}${installed_version:-unknown}."
+        return 0
     fi
+
+    print_message info "${MUTED}Version ${NC}$specific_version${MUTED} already installed"
+    # Deliberately NOT `exit 0`: the PATH-configuration block below is how a
+    # "dragon: command not found" is repaired, and re-running the installer is
+    # the documented remedy. Exiting here meant a same-version reinstall could
+    # never fix PATH, and never wrote $GITHUB_PATH in CI.
+    skip_download=true
 }
 
 unbuffered_sed() {
@@ -452,7 +505,13 @@ if [ -n "$binary_path" ]; then
     install_from_binary
 else
     check_version
-    download_and_install
+    # check_version sets skip_download when the requested version is already the
+    # one sitting in $INSTALL_DIR. Falling through (instead of exiting) means the
+    # PATH configuration below still runs, which is the whole point of telling a
+    # user to re-run the installer.
+    if [ "$skip_download" = false ]; then
+        download_and_install
+    fi
 fi
 
 
