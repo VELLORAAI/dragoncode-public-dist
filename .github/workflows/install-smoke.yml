@@ -26,7 +26,15 @@ jobs:
           - os: ubuntu-latest    # linux-x64 (glibc)
           - os: ubuntu-24.04-arm # linux-arm64 (the 5th shipped platform)
           - os: macos-14         # darwin-arm64 (Apple Silicon)
-          - os: macos-13         # darwin-x64 (Intel)
+          # Was macos-13 for darwin-x64 (Intel). That runner label is retired:
+          # the job sat queued until GitHub cancelled it on every weekly run
+          # since 2026-08-17, so this leg had silently provided no coverage at
+          # all and would have blocked any installer PR forever. macos-15 is
+          # the label the release workflow itself uses to verify the darwin-x64
+          # asset (under Rosetta); the installer's own logic is identical across
+          # macOS architectures except the Rosetta/baseline branches, and the
+          # Intel BINARY is exercised by that release verify, not here.
+          - os: macos-15         # second macOS image (Intel label retired)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
