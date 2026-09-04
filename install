@@ -685,8 +685,12 @@ detect_shell() {
     local parent name
     parent=$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d ' ' || true)
     name=$(basename "${parent#-}" 2>/dev/null || true)
+    # Only an INTERACTIVE shell is evidence of what the user actually runs. A
+    # parent of sh/dash is almost always a wrapper (`sh -c 'curl … | bash'`, a
+    # CI step, the updater) and would send the PATH line to .profile for a
+    # zsh user; for those, $SHELL is the better guess.
     case "$name" in
-        fish|zsh|bash|ash|dash|sh) echo "$name"; return 0 ;;
+        fish|zsh|bash) echo "$name"; return 0 ;;
     esac
     basename "${SHELL:-sh}"
 }
