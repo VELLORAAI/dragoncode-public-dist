@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+
+# This installer requires bash, and it is normally PIPED to a shell
+# (`curl … | bash`), which means the shebang above is never consulted — the
+# shell that reads stdin is whatever the caller chose. The in-product updater
+# picks `sh` whenever `bash --version` fails (installation/index.ts), so on a
+# musl/Alpine host with no bash this file can be handed to dash.
+#
+# Under dash the very next line dies with `set: Illegal option -o pipefail`,
+# and the rest of the script — [[ ]], arrays, ${var// /x}, `local` — is not
+# parseable either. That produced a cryptic failure mid-run instead of a
+# sentence anyone could act on.
+#
+# This guard is deliberately POSIX-only and deliberately FIRST: a shell reads
+# and executes complete commands as it goes, so exiting here means the
+# bash-only syntax further down is never parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "dragon: this installer requires bash, but is running under a different shell." >&2
+    if command -v bash >/dev/null 2>&1; then
+        echo "dragon: bash is installed - re-run the installer with it:" >&2
+    else
+        echo "dragon: install bash, then re-run the installer with it:" >&2
+    fi
+    echo "  curl -fsSL https://raw.githubusercontent.com/VELLORAAI/dragoncode-public-dist/main/install | bash" >&2
+    exit 1
+fi
+
 set -euo pipefail
 APP=dragon
 
@@ -18,6 +44,7 @@ Options:
     -v, --version <version> Install a specific version (e.g., 1.0.180)
     -b, --binary <path>     Install from a local binary instead of downloading
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
+        --require-checksum  Refuse to install if the download cannot be checksum-verified
 
 Examples:
     curl -fsSL https://raw.githubusercontent.com/VELLORAAI/dragoncode-public-dist/main/install | bash
@@ -29,6 +56,11 @@ EOF
 requested_version=${VERSION:-}
 no_modify_path=false
 binary_path=""
+# Refuse to install when the archive cannot be checksum-verified, instead of
+# warning and continuing.
+require_checksum=false
+# Set by check_version when $INSTALL_DIR already holds the requested version.
+skip_download=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,9 +90,19 @@ while [[ $# -gt 0 ]]; do
             no_modify_path=true
             shift
             ;;
-        *)
-            echo -e "${ORANGE}Warning: Unknown option '$1'${NC}" >&2
+        --require-checksum)
+            require_checksum=true
             shift
+            ;;
+        *)
+            # Was a warning that shifted and carried on. In a script whose whole
+            # job is version pinning, that turned a typo into a SILENT pin
+            # failure: `--verison 1.5.61` warned twice and installed *latest*,
+            # and the only evidence was two lines of scrollback. Refuse instead.
+            echo -e "${RED}Error: unknown option '$1'${NC}" >&2
+            echo "" >&2
+            usage >&2
+            exit 1
             ;;
     esac
 done
@@ -191,10 +233,22 @@ else
 
     if [ -z "$requested_version" ]; then
         release_base="https://github.com/VELLORAAI/dragoncode-public-dist/releases/latest/download"
-        specific_version=$(curl -s https://api.github.com/repos/VELLORAAI/dragoncode-public-dist/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
-
-        if [[ $? -ne 0 || -z "$specific_version" ]]; then
-            echo -e "${RED}Failed to fetch version information${NC}"
+        # `$?` here read the PIPELINE's status (sed's), never curl's, and under
+        # `set -euo pipefail` a network failure killed the script on the line
+        # above -- so the friendly message below was unreachable on exactly the
+        # failure it was written for. Capture the failure explicitly instead.
+        latest_json=""
+        if ! latest_json=$(curl -fsSL https://api.github.com/repos/VELLORAAI/dragoncode-public-dist/releases/latest 2>/dev/null); then
+            echo -e "${RED}Failed to reach GitHub to determine the latest version.${NC}" >&2
+            echo -e "${MUTED}Check your connection, or pass --version <x.y.z> to pin one.${NC}" >&2
+            exit 1
+        fi
+        specific_version=$(printf '%s' "$latest_json" | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+        if [ -z "$specific_version" ]; then
+            # Reached when GitHub answers but the body is not a release (most
+            # often an anonymous rate-limit JSON, 60 requests/hour per IP).
+            echo -e "${RED}Could not read the latest version from GitHub's response.${NC}" >&2
+            echo -e "${MUTED}This is usually API rate limiting; retry shortly, or pass --version <x.y.z>.${NC}" >&2
             exit 1
         fi
     else
@@ -204,12 +258,24 @@ else
         specific_version=$requested_version
 
         # Verify the release exists before downloading
-        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/VELLORAAI/dragoncode-public-dist/releases/tag/v${requested_version}")
-        if [ "$http_status" = "404" ]; then
-            echo -e "${RED}Error: Release v${requested_version} not found${NC}"
-            echo -e "${MUTED}Available releases: https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}"
-            exit 1
-        fi
+        http_status=$(curl -sIL -o /dev/null -w "%{http_code}" "https://github.com/VELLORAAI/dragoncode-public-dist/releases/tag/v${requested_version}" 2>/dev/null || echo 000)
+        case "$http_status" in
+            2*)
+                ;;
+            404)
+                echo -e "${RED}Error: Release v${requested_version} not found${NC}" >&2
+                echo -e "${MUTED}Available releases: https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}" >&2
+                exit 1
+                ;;
+            *)
+                # Only 404 used to be handled, so a network failure (000) or a
+                # 5xx fell through and surfaced later as "no matching release
+                # asset" -- a message describing the wrong cause entirely.
+                echo -e "${RED}Error: could not confirm release v${requested_version} exists (HTTP ${http_status}).${NC}" >&2
+                echo -e "${MUTED}Check your connection and retry.${NC}" >&2
+                exit 1
+                ;;
+        esac
     fi
 
     # Resolve the actual asset. We may have appended a -baseline (older x86-64,
@@ -252,27 +318,46 @@ print_message() {
 
     case $level in
         info) color="${NC}" ;;
-        warning) color="${NC}" ;;
+        warning) color="${ORANGE}" ;;
         error) color="${RED}" ;;
     esac
 
     echo -e "${color}${message}${NC}"
 }
 
+# Decide whether there is anything to do, by asking the binary we are about to
+# REPLACE — not whatever `dragon` happens to be first on PATH.
+#
+# This used to run `command -v dragon` / `dragon --version`. When PATH resolved
+# a different dragon than $INSTALL_DIR — a shim, a package-manager copy, a stale
+# PATH entry, or simply a different $HOME — the installer compared against a
+# binary it was never going to touch, printed "already installed", and exited 0
+# having installed NOTHING. Reproduced: a 1.5.59 install with a 1.5.60 on PATH
+# reported success and stayed on 1.5.59. `dragon_path=$(which dragon)` was
+# assigned and never read: the vestige of the $INSTALL_DIR guard this restores.
+#
+# Returning (rather than exiting) when there is no existing install is the other
+# half: absence must mean "go install it", never "nothing to do".
 check_version() {
-    if command -v dragon >/dev/null 2>&1; then
-        dragon_path=$(which dragon)
+    local target="${INSTALL_DIR}/${bin_name}"
 
-        ## Check the installed version
-        installed_version=$(dragon --version 2>/dev/null || echo "")
+    [ -x "$target" ] || return 0
 
-        if [[ "$installed_version" != "$specific_version" ]]; then
-            print_message info "${MUTED}Installed version: ${NC}$installed_version."
-        else
-            print_message info "${MUTED}Version ${NC}$specific_version${MUTED} already installed"
-            exit 0
-        fi
+    # tr -d '\r' because the Windows binary reports with CRLF endings.
+    local installed_version
+    installed_version=$("$target" --version 2>/dev/null | tr -d '\r' || echo "")
+
+    if [ "$installed_version" != "$specific_version" ]; then
+        print_message info "${MUTED}Installed version: ${NC}${installed_version:-unknown}."
+        return 0
     fi
+
+    print_message info "${MUTED}Version ${NC}$specific_version${MUTED} already installed"
+    # Deliberately NOT `exit 0`: the PATH-configuration block below is how a
+    # "dragon: command not found" is repaired, and re-running the installer is
+    # the documented remedy. Exiting here meant a same-version reinstall could
+    # never fix PATH, and never wrote $GITHUB_PATH in CI.
+    skip_download=true
 }
 
 unbuffered_sed() {
@@ -315,20 +400,24 @@ download_with_progress() {
         exec 4>/dev/null
     fi
 
-    local tmp_dir=${TMPDIR:-/tmp}
-    local basename="${tmp_dir}/dragon_install_$$"
-    local tracefile="${basename}.trace"
+    # mktemp -d, not a predictable "$$" name: mkfifo into a world-writable
+    # directory at a guessable path is a local race.
+    local trace_dir
+    trace_dir=$(mktemp -d "${TMPDIR:-/tmp}/dragon_trace_XXXXXX")
+    local tracefile="${trace_dir}/progress.trace"
 
-    rm -f "$tracefile"
     mkfifo "$tracefile"
 
     # Hide cursor
     printf "\033[?25l" >&4
 
-    trap "trap - RETURN; rm -f \"$tracefile\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
+    trap "trap - RETURN; rm -rf \"$trace_dir\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
 
     (
-        curl --trace-ascii "$tracefile" -s -L -o "$output" "$url"
+        # -f: without it curl writes a 404/5xx error PAGE into $output and
+        # exits 0, so the archive is "downloaded" and only fails later as a
+        # baffling tar/unzip error.
+        curl -f --trace-ascii "$tracefile" -s -L -o "$output" "$url"
     ) &
     local curl_pid=$!
 
@@ -365,11 +454,32 @@ download_with_progress() {
     return $ret
 }
 
+# Called when the archive could not be checked at all. Default is to warn and
+# continue, so minimal environments still install; --require-checksum turns the
+# same condition into a refusal, for anyone who would rather not install than
+# install unverified.
+#
+# This exists because "skipping verification" was previously a plain info-level
+# warning rendered WITHOUT colour, on the two paths most likely to fire in
+# practice -- and one of them fires on any rate-limited or NAT'd corporate IP,
+# not just on a machine missing tools. Combined with a download that used to
+# ignore HTTP errors, that made the integrity gate quietly absent exactly when
+# it mattered. It is now visibly a warning, and refusable.
+checksum_unverified() {
+    local reason="$1"
+    if [ "$require_checksum" = true ]; then
+        print_message error "Refusing to install ${filename}: ${reason} (--require-checksum)."
+        exit 1
+    fi
+    print_message warning "NOT VERIFIED: ${reason}. Continuing (pass --require-checksum to refuse instead)."
+}
+
 # Verify a downloaded archive against the SHA256 digest GitHub publishes for the
 # release asset (best-effort supply-chain integrity on top of TLS). A genuine
 # mismatch ALWAYS aborts. When the tools to check are absent (no sha256sum/shasum,
 # or neither jq nor python3 to read the API, or the API is unreachable) it warns
-# and continues rather than breaking installs in minimal environments.
+# and continues rather than breaking installs in minimal environments -- unless
+# --require-checksum was passed, which makes that condition fatal.
 verify_checksum() {
     local file="$1" fname="$2" version="$3"
 
@@ -380,7 +490,7 @@ verify_checksum() {
         sha_tool="shasum -a 256"
     fi
     if [ -z "$sha_tool" ]; then
-        print_message warning "No sha256 tool (sha256sum/shasum) found; skipping checksum verification."
+        checksum_unverified "no sha256 tool (sha256sum/shasum) is available"
         return 0
     fi
 
@@ -388,8 +498,13 @@ verify_checksum() {
     local json expected=""
     json=$(curl -fsSL "$api" 2>/dev/null) || json=""
     if [ -n "$json" ]; then
+        # `|| true` on both: a tool that EXISTS but fails (a shim, a broken
+        # install, a wrong-architecture binary) makes the pipeline non-zero, and
+        # under `set -euo pipefail` that aborted the installer here — after the
+        # download had completed, printing nothing at all. Failing to READ the
+        # expected digest is "unverified", which the caller already handles.
         if command -v jq >/dev/null 2>&1; then
-            expected=$(printf '%s' "$json" | jq -r --arg n "$fname" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null | sed 's/^sha256://')
+            expected=$(printf '%s' "$json" | jq -r --arg n "$fname" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null | sed 's/^sha256://' || true)
         elif command -v python3 >/dev/null 2>&1; then
             expected=$(printf '%s' "$json" | python3 -c 'import sys, json
 try:
@@ -400,16 +515,27 @@ try:
             print((a.get("digest") or "").replace("sha256:", ""))
             break
 except Exception:
-    pass' "$fname" 2>/dev/null)
+    pass' "$fname" 2>/dev/null || true)
         fi
     fi
     if [ -z "$expected" ]; then
-        print_message warning "Could not fetch the expected checksum for ${fname}; skipping verification."
+        checksum_unverified "the expected checksum for ${fname} could not be fetched (no jq/python3, or the GitHub API was unreachable or rate-limited)"
         return 0
     fi
 
-    local actual
-    actual=$($sha_tool "$file" 2>/dev/null | awk '{print $1}')
+    # `|| true` because a sha tool that EXISTS but fails (broken install, wrong
+    # architecture, a shim on PATH) makes this pipeline non-zero, and under
+    # `set -euo pipefail` that aborted the whole installer right here — after a
+    # completed download, with no message whatsoever. Being unable to compute a
+    # digest is "unverified", the same as not having a tool; it is not a mismatch
+    # and must not masquerade as one.
+    local actual=""
+    actual=$($sha_tool "$file" 2>/dev/null | awk '{print $1}' || true)
+    if [ -z "$actual" ]; then
+        checksum_unverified "the sha256 tool (${sha_tool%% *}) could not hash ${fname}"
+        return 0
+    fi
+
     if [ "$actual" != "$expected" ]; then
         print_message error "Checksum mismatch for ${fname} - aborting install (possible corrupted or tampered download).\n  expected: sha256:${expected}\n  actual:   sha256:${actual}"
         rm -rf "$(dirname "$file")"
@@ -420,12 +546,22 @@ except Exception:
 
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}DragonCode ${MUTED}version: ${NC}$specific_version"
-    local tmp_dir="${TMPDIR:-/tmp}/dragon_install_$$"
-    mkdir -p "$tmp_dir"
+    # mktemp, not "$$": the old ${TMPDIR:-/tmp}/dragon_install_$$ was predictable,
+    # and `mkdir -p` succeeds onto a pre-existing symlink-to-directory, so a local
+    # attacker who won the race chose where the archive was extracted.
+    local tmp_dir
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/dragon_install_XXXXXX")
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url" "$tmp_dir/$filename"; then
-        # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
-        curl -# -L -o "$tmp_dir/$filename" "$url"
+        # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails.
+        # -f so an HTTP error is an error: without it curl saves the error page as
+        # the archive and exits 0, and the install fails later with a tar/unzip
+        # message that describes the symptom and not the cause.
+        if ! curl -f -# -L -o "$tmp_dir/$filename" "$url"; then
+            print_message error "Failed to download ${filename} from ${url}"
+            rm -rf "$tmp_dir"
+            exit 1
+        fi
     fi
 
     # Integrity gate before we extract and run anything from the archive.
@@ -437,22 +573,89 @@ download_and_install() {
         unzip -q "$tmp_dir/$filename" -d "$tmp_dir"
     fi
 
-    mv "$tmp_dir/$bin_name" "${INSTALL_DIR}/${bin_name}"
-    chmod 755 "${INSTALL_DIR}/${bin_name}" 2>/dev/null || true
+    place_binary "$tmp_dir/$bin_name"
     rm -rf "$tmp_dir"
+}
+
+# Put a freshly-downloaded binary at its final path.
+#
+# The old code did a bare `mv` (download path) or `cp` (--binary path) straight
+# over the destination. Two ways that failed:
+#
+#  - ETXTBSY. $tmp_dir lives under $TMPDIR and $INSTALL_DIR under $HOME, which
+#    on Linux are routinely different filesystems, so `mv` degrades from
+#    rename(2) to copy-in-place -- and copying over a RUNNING executable fails
+#    with "Text file busy". That is exactly the self-upgrade path: `dragon
+#    upgrade` runs this installer while dragon is running. install.ps1 has
+#    always handled this (it renames the running image aside first); bash did
+#    not.
+#  - On macOS, writing over an existing signed binary invalidates the code
+#    signature and the process is then killed on launch with no message.
+#
+# Moving the old file aside first solves both: the destination becomes a fresh
+# inode, the running image keeps its own (unlinked) file until it exits, and the
+# signature travels with the new file rather than being spliced into the old one.
+place_binary() {
+    local src="$1"
+    local dest="${INSTALL_DIR}/${bin_name}"
+    local previous="${dest}.previous"
+
+    if [ -e "$dest" ]; then
+        rm -f "$previous" 2>/dev/null || true
+        # A rename within one directory is atomic and works even while the old
+        # binary is executing.
+        if ! mv -f "$dest" "$previous" 2>/dev/null; then
+            print_message error "Could not move the existing ${bin_name} aside at ${dest}"
+            exit 1
+        fi
+    fi
+
+    if ! mv -f "$src" "$dest" 2>/dev/null; then
+        # Cross-device: fall back to copy + rename into place, never a copy
+        # straight over $dest.
+        local staged="${dest}.new.$$"
+        if ! cp "$src" "$staged" || ! chmod 755 "$staged" || ! mv -f "$staged" "$dest"; then
+            rm -f "$staged" 2>/dev/null || true
+            # Put the old one back rather than leaving the user with nothing.
+            [ -e "$previous" ] && mv -f "$previous" "$dest" 2>/dev/null || true
+            print_message error "Failed to install ${bin_name} to ${dest}"
+            exit 1
+        fi
+    fi
+
+    # A failed chmod used to be swallowed with `|| true`, leaving a
+    # non-executable binary behind a success message.
+    if ! chmod 755 "$dest"; then
+        print_message error "Installed ${dest} but could not make it executable"
+        exit 1
+    fi
+
+    rm -f "$previous" 2>/dev/null || true
 }
 
 install_from_binary() {
     print_message info "\n${MUTED}Installing ${NC}DragonCode ${MUTED}from: ${NC}$binary_path"
-    cp "$binary_path" "${INSTALL_DIR}/${bin_name}"
-    chmod 755 "${INSTALL_DIR}/${bin_name}" 2>/dev/null || true
+    local staged
+    staged=$(mktemp "${TMPDIR:-/tmp}/dragon_local_XXXXXX")
+    if ! cp "$binary_path" "$staged"; then
+        rm -f "$staged" 2>/dev/null || true
+        print_message error "Could not read ${binary_path}"
+        exit 1
+    fi
+    place_binary "$staged"
 }
 
 if [ -n "$binary_path" ]; then
     install_from_binary
 else
     check_version
-    download_and_install
+    # check_version sets skip_download when the requested version is already the
+    # one sitting in $INSTALL_DIR. Falling through (instead of exiting) means the
+    # PATH configuration below still runs, which is the whole point of telling a
+    # user to re-run the installer.
+    if [ "$skip_download" = false ]; then
+        download_and_install
+    fi
 fi
 
 
@@ -474,32 +677,53 @@ add_to_path() {
 
 XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 
-current_shell=$(basename "$SHELL")
+# $SHELL is the LOGIN shell from passwd, not the shell running this script. In
+# containers and CI it is frequently /bin/sh while the user's real rc file is
+# .bashrc, which sent the PATH line to a file their shell never sources. Prefer
+# the parent process's actual shell and fall back to $SHELL.
+detect_shell() {
+    local parent name
+    parent=$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d ' ' || true)
+    name=$(basename "${parent#-}" 2>/dev/null || true)
+    # Only an INTERACTIVE shell is evidence of what the user actually runs. A
+    # parent of sh/dash is almost always a wrapper (`sh -c 'curl … | bash'`, a
+    # CI step, the updater) and would send the PATH line to .profile for a
+    # zsh user; for those, $SHELL is the better guess.
+    case "$name" in
+        fish|zsh|bash) echo "$name"; return 0 ;;
+    esac
+    basename "${SHELL:-sh}"
+}
+
+current_shell=$(detect_shell)
+
+# An ARRAY, not a space-separated string. This was previously one string split
+# by an unquoted `for file in $config_files`, so any space in $HOME, $ZDOTDIR or
+# $XDG_CONFIG_HOME -- "/Users/John Smith" -- shattered it into tokens that match
+# no file. The user then silently fell through to "No config file found" and
+# their PATH was never written.
 case $current_shell in
     fish)
-        config_files="$HOME/.config/fish/config.fish"
+        config_files=("$HOME/.config/fish/config.fish")
     ;;
     zsh)
-        config_files="${ZDOTDIR:-$HOME}/.zshrc ${ZDOTDIR:-$HOME}/.zshenv $XDG_CONFIG_HOME/zsh/.zshrc $XDG_CONFIG_HOME/zsh/.zshenv"
+        config_files=("${ZDOTDIR:-$HOME}/.zshrc" "${ZDOTDIR:-$HOME}/.zshenv" "$XDG_CONFIG_HOME/zsh/.zshrc" "$XDG_CONFIG_HOME/zsh/.zshenv")
     ;;
     bash)
-        config_files="$HOME/.bashrc $HOME/.bash_profile $HOME/.profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
+        config_files=("$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$XDG_CONFIG_HOME/bash/.bashrc" "$XDG_CONFIG_HOME/bash/.bash_profile")
     ;;
-    ash)
-        config_files="$HOME/.ashrc $HOME/.profile /etc/profile"
-    ;;
-    sh)
-        config_files="$HOME/.ashrc $HOME/.profile /etc/profile"
+    ash|dash|sh)
+        config_files=("$HOME/.ashrc" "$HOME/.profile" "/etc/profile")
     ;;
     *)
         # Default case if none of the above matches
-        config_files="$HOME/.bashrc $HOME/.bash_profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
+        config_files=("$HOME/.bashrc" "$HOME/.bash_profile" "$XDG_CONFIG_HOME/bash/.bashrc" "$XDG_CONFIG_HOME/bash/.bash_profile")
     ;;
 esac
 
 if [[ "$no_modify_path" != "true" ]]; then
     config_file=""
-    for file in $config_files; do
+    for file in "${config_files[@]}"; do
         if [[ -f $file ]]; then
             config_file=$file
             break
@@ -520,10 +744,7 @@ if [[ "$no_modify_path" != "true" ]]; then
             bash)
                 add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
             ;;
-            ash)
-                add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
-            ;;
-            sh)
+            ash|dash|sh)
                 add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
             ;;
             *)
@@ -535,9 +756,20 @@ if [[ "$no_modify_path" != "true" ]]; then
     fi
 fi
 
-if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" == "true" ]; then
-    echo "$INSTALL_DIR" >> $GITHUB_PATH
-    print_message info "Added $INSTALL_DIR to \$GITHUB_PATH"
+# GITHUB_ACTIONS was guarded defensively on the line above, then $GITHUB_PATH
+# was dereferenced bare on the next -- an unbound-variable abort under `set -u`
+# wherever GITHUB_ACTIONS=true is set without the file (act, some containers).
+# Unquoted, too, so a path with a space would have redirected to the wrong file.
+if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" = "true" ]; then
+    if [ -n "${GITHUB_PATH-}" ]; then
+        if echo "$INSTALL_DIR" >> "$GITHUB_PATH"; then
+            print_message info "Added $INSTALL_DIR to \$GITHUB_PATH"
+        else
+            print_message warning "Could not append $INSTALL_DIR to \$GITHUB_PATH ($GITHUB_PATH)"
+        fi
+    else
+        print_message warning "GITHUB_ACTIONS is set but \$GITHUB_PATH is not; skipping the PATH export."
+    fi
 fi
 
 echo -e ""

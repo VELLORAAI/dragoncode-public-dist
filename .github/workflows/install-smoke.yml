@@ -26,7 +26,15 @@ jobs:
           - os: ubuntu-latest    # linux-x64 (glibc)
           - os: ubuntu-24.04-arm # linux-arm64 (the 5th shipped platform)
           - os: macos-14         # darwin-arm64 (Apple Silicon)
-          - os: macos-13         # darwin-x64 (Intel)
+          # Was macos-13 for darwin-x64 (Intel). That runner label is retired:
+          # the job sat queued until GitHub cancelled it on every weekly run
+          # since 2026-08-17, so this leg had silently provided no coverage at
+          # all and would have blocked any installer PR forever. macos-15 is
+          # the label the release workflow itself uses to verify the darwin-x64
+          # asset (under Rosetta); the installer's own logic is identical across
+          # macOS architectures except the Rosetta/baseline branches, and the
+          # Intel BINARY is exercised by that release verify, not here.
+          - os: macos-15         # second macOS image (Intel label retired)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -99,3 +107,87 @@ jobs:
             echo "$plain => $code (expected 200)"
             test "$code" = "200" || { echo "fallback target $plain is missing from latest release"; exit 1; }
           done
+
+  silent-failure-guards:
+    name: the installer refuses to succeed without installing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # THE regression test. The jobs above all run on a clean runner, where
+      # `dragon` is on no PATH at all — so the version check never reaches the
+      # branch that was broken, and they passed happily throughout. Catching it
+      # requires deliberately putting a DIFFERENT dragon earlier on PATH.
+      - name: A conflicting dragon on PATH does not suppress the install
+        run: |
+          set -euo pipefail
+          target=1.5.61
+          mkdir -p "$HOME/decoy" "$HOME/.dragoncode/bin"
+          # A decoy that claims to already BE the target version.
+          printf '#!/bin/sh\necho %s\n' "$target" > "$HOME/decoy/dragon"
+          chmod +x "$HOME/decoy/dragon"
+          # ...while the directory the installer actually writes holds an older one.
+          printf '#!/bin/sh\necho 0.0.1\n' > "$HOME/.dragoncode/bin/dragon"
+          chmod +x "$HOME/.dragoncode/bin/dragon"
+
+          PATH="$HOME/decoy:$PATH" bash ./install --version "$target"
+
+          got="$("$HOME/.dragoncode/bin/dragon" --version 2>&1 | tr -d '\r')"
+          echo "install dir reports => $got (expected $target)"
+          test "$got" = "$target" || {
+            echo "REGRESSION: the installer consulted PATH instead of its install dir and installed nothing"
+            exit 1
+          }
+
+      - name: A space in \$HOME still gets PATH written
+        run: |
+          set -euo pipefail
+          home="/tmp/John Smith"
+          rm -rf "$home"; mkdir -p "$home"
+          : > "$home/.bashrc"
+          SHELL=/bin/bash HOME="$home" bash ./install --version 1.5.61
+          grep -q dragoncode "$home/.bashrc" || {
+            echo "REGRESSION: word-splitting on \$HOME left PATH unwritten"
+            exit 1
+          }
+
+      - name: GITHUB_ACTIONS without GITHUB_PATH does not abort
+        run: |
+          set -euo pipefail
+          home=/tmp/ci-nopath
+          rm -rf "$home"; mkdir -p "$home"
+          env -u GITHUB_PATH GITHUB_ACTIONS=true HOME="$home" bash ./install --version 1.5.61
+          test -x "$home/.dragoncode/bin/dragon" || { echo "install did not complete"; exit 1; }
+
+      - name: An unknown option is refused, never a silent fall back to latest
+        run: |
+          set -euo pipefail
+          if bash ./install --verison 1.5.61 >/dev/null 2>&1; then
+            echo "REGRESSION: a typo'd flag was accepted and would install 'latest'"
+            exit 1
+          fi
+
+      - name: A non-bash shell gets an actionable message, not a syntax error
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y dash >/dev/null 2>&1 || true
+          out="$(dash ./install 2>&1 || true)"
+          echo "$out"
+          echo "$out" | grep -q "requires bash" || {
+            echo "REGRESSION: non-bash shells no longer get the guard message"
+            exit 1
+          }
+
+      - name: --require-checksum refuses when it cannot verify
+        run: |
+          set -euo pipefail
+          home=/tmp/nochecksum
+          rm -rf "$home"; mkdir -p "$home/stub"
+          # Hide every tool the checksum path needs, so verification cannot run.
+          for t in sha256sum shasum jq python3; do
+            printf '#!/bin/sh\nexit 127\n' > "$home/stub/$t"; chmod +x "$home/stub/$t"
+          done
+          if PATH="$home/stub:$PATH" HOME="$home" bash ./install --version 1.5.61 --require-checksum >/dev/null 2>&1; then
+            echo "REGRESSION: --require-checksum installed an unverifiable download"
+            exit 1
+          fi
