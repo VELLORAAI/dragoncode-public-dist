@@ -233,10 +233,22 @@ else
 
     if [ -z "$requested_version" ]; then
         release_base="https://github.com/VELLORAAI/dragoncode-public-dist/releases/latest/download"
-        specific_version=$(curl -s https://api.github.com/repos/VELLORAAI/dragoncode-public-dist/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
-
-        if [[ $? -ne 0 || -z "$specific_version" ]]; then
-            echo -e "${RED}Failed to fetch version information${NC}"
+        # `$?` here read the PIPELINE's status (sed's), never curl's, and under
+        # `set -euo pipefail` a network failure killed the script on the line
+        # above -- so the friendly message below was unreachable on exactly the
+        # failure it was written for. Capture the failure explicitly instead.
+        latest_json=""
+        if ! latest_json=$(curl -fsSL https://api.github.com/repos/VELLORAAI/dragoncode-public-dist/releases/latest 2>/dev/null); then
+            echo -e "${RED}Failed to reach GitHub to determine the latest version.${NC}" >&2
+            echo -e "${MUTED}Check your connection, or pass --version <x.y.z> to pin one.${NC}" >&2
+            exit 1
+        fi
+        specific_version=$(printf '%s' "$latest_json" | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+        if [ -z "$specific_version" ]; then
+            # Reached when GitHub answers but the body is not a release (most
+            # often an anonymous rate-limit JSON, 60 requests/hour per IP).
+            echo -e "${RED}Could not read the latest version from GitHub's response.${NC}" >&2
+            echo -e "${MUTED}This is usually API rate limiting; retry shortly, or pass --version <x.y.z>.${NC}" >&2
             exit 1
         fi
     else
@@ -246,12 +258,24 @@ else
         specific_version=$requested_version
 
         # Verify the release exists before downloading
-        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/VELLORAAI/dragoncode-public-dist/releases/tag/v${requested_version}")
-        if [ "$http_status" = "404" ]; then
-            echo -e "${RED}Error: Release v${requested_version} not found${NC}"
-            echo -e "${MUTED}Available releases: https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}"
-            exit 1
-        fi
+        http_status=$(curl -sIL -o /dev/null -w "%{http_code}" "https://github.com/VELLORAAI/dragoncode-public-dist/releases/tag/v${requested_version}" 2>/dev/null || echo 000)
+        case "$http_status" in
+            2*)
+                ;;
+            404)
+                echo -e "${RED}Error: Release v${requested_version} not found${NC}" >&2
+                echo -e "${MUTED}Available releases: https://github.com/VELLORAAI/dragoncode-public-dist/releases${NC}" >&2
+                exit 1
+                ;;
+            *)
+                # Only 404 used to be handled, so a network failure (000) or a
+                # 5xx fell through and surfaced later as "no matching release
+                # asset" -- a message describing the wrong cause entirely.
+                echo -e "${RED}Error: could not confirm release v${requested_version} exists (HTTP ${http_status}).${NC}" >&2
+                echo -e "${MUTED}Check your connection and retry.${NC}" >&2
+                exit 1
+                ;;
+        esac
     fi
 
     # Resolve the actual asset. We may have appended a -baseline (older x86-64,
@@ -474,8 +498,13 @@ verify_checksum() {
     local json expected=""
     json=$(curl -fsSL "$api" 2>/dev/null) || json=""
     if [ -n "$json" ]; then
+        # `|| true` on both: a tool that EXISTS but fails (a shim, a broken
+        # install, a wrong-architecture binary) makes the pipeline non-zero, and
+        # under `set -euo pipefail` that aborted the installer here — after the
+        # download had completed, printing nothing at all. Failing to READ the
+        # expected digest is "unverified", which the caller already handles.
         if command -v jq >/dev/null 2>&1; then
-            expected=$(printf '%s' "$json" | jq -r --arg n "$fname" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null | sed 's/^sha256://')
+            expected=$(printf '%s' "$json" | jq -r --arg n "$fname" '.assets[] | select(.name==$n) | .digest // empty' 2>/dev/null | sed 's/^sha256://' || true)
         elif command -v python3 >/dev/null 2>&1; then
             expected=$(printf '%s' "$json" | python3 -c 'import sys, json
 try:
@@ -486,7 +515,7 @@ try:
             print((a.get("digest") or "").replace("sha256:", ""))
             break
 except Exception:
-    pass' "$fname" 2>/dev/null)
+    pass' "$fname" 2>/dev/null || true)
         fi
     fi
     if [ -z "$expected" ]; then
@@ -494,8 +523,19 @@ except Exception:
         return 0
     fi
 
-    local actual
-    actual=$($sha_tool "$file" 2>/dev/null | awk '{print $1}')
+    # `|| true` because a sha tool that EXISTS but fails (broken install, wrong
+    # architecture, a shim on PATH) makes this pipeline non-zero, and under
+    # `set -euo pipefail` that aborted the whole installer right here — after a
+    # completed download, with no message whatsoever. Being unable to compute a
+    # digest is "unverified", the same as not having a tool; it is not a mismatch
+    # and must not masquerade as one.
+    local actual=""
+    actual=$($sha_tool "$file" 2>/dev/null | awk '{print $1}' || true)
+    if [ -z "$actual" ]; then
+        checksum_unverified "the sha256 tool (${sha_tool%% *}) could not hash ${fname}"
+        return 0
+    fi
+
     if [ "$actual" != "$expected" ]; then
         print_message error "Checksum mismatch for ${fname} - aborting install (possible corrupted or tampered download).\n  expected: sha256:${expected}\n  actual:   sha256:${actual}"
         rm -rf "$(dirname "$file")"
