@@ -44,6 +44,7 @@ Options:
     -v, --version <version> Install a specific version (e.g., 1.0.180)
     -b, --binary <path>     Install from a local binary instead of downloading
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
+        --require-checksum  Refuse to install if the download cannot be checksum-verified
 
 Examples:
     curl -fsSL https://raw.githubusercontent.com/VELLORAAI/dragoncode-public-dist/main/install | bash
@@ -55,6 +56,9 @@ EOF
 requested_version=${VERSION:-}
 no_modify_path=false
 binary_path=""
+# Refuse to install when the archive cannot be checksum-verified, instead of
+# warning and continuing.
+require_checksum=false
 # Set by check_version when $INSTALL_DIR already holds the requested version.
 skip_download=false
 
@@ -84,6 +88,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-modify-path)
             no_modify_path=true
+            shift
+            ;;
+        --require-checksum)
+            require_checksum=true
             shift
             ;;
         *)
@@ -286,7 +294,7 @@ print_message() {
 
     case $level in
         info) color="${NC}" ;;
-        warning) color="${NC}" ;;
+        warning) color="${ORANGE}" ;;
         error) color="${RED}" ;;
     esac
 
@@ -368,20 +376,24 @@ download_with_progress() {
         exec 4>/dev/null
     fi
 
-    local tmp_dir=${TMPDIR:-/tmp}
-    local basename="${tmp_dir}/dragon_install_$$"
-    local tracefile="${basename}.trace"
+    # mktemp -d, not a predictable "$$" name: mkfifo into a world-writable
+    # directory at a guessable path is a local race.
+    local trace_dir
+    trace_dir=$(mktemp -d "${TMPDIR:-/tmp}/dragon_trace_XXXXXX")
+    local tracefile="${trace_dir}/progress.trace"
 
-    rm -f "$tracefile"
     mkfifo "$tracefile"
 
     # Hide cursor
     printf "\033[?25l" >&4
 
-    trap "trap - RETURN; rm -f \"$tracefile\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
+    trap "trap - RETURN; rm -rf \"$trace_dir\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
 
     (
-        curl --trace-ascii "$tracefile" -s -L -o "$output" "$url"
+        # -f: without it curl writes a 404/5xx error PAGE into $output and
+        # exits 0, so the archive is "downloaded" and only fails later as a
+        # baffling tar/unzip error.
+        curl -f --trace-ascii "$tracefile" -s -L -o "$output" "$url"
     ) &
     local curl_pid=$!
 
@@ -418,11 +430,32 @@ download_with_progress() {
     return $ret
 }
 
+# Called when the archive could not be checked at all. Default is to warn and
+# continue, so minimal environments still install; --require-checksum turns the
+# same condition into a refusal, for anyone who would rather not install than
+# install unverified.
+#
+# This exists because "skipping verification" was previously a plain info-level
+# warning rendered WITHOUT colour, on the two paths most likely to fire in
+# practice -- and one of them fires on any rate-limited or NAT'd corporate IP,
+# not just on a machine missing tools. Combined with a download that used to
+# ignore HTTP errors, that made the integrity gate quietly absent exactly when
+# it mattered. It is now visibly a warning, and refusable.
+checksum_unverified() {
+    local reason="$1"
+    if [ "$require_checksum" = true ]; then
+        print_message error "Refusing to install ${filename}: ${reason} (--require-checksum)."
+        exit 1
+    fi
+    print_message warning "NOT VERIFIED: ${reason}. Continuing (pass --require-checksum to refuse instead)."
+}
+
 # Verify a downloaded archive against the SHA256 digest GitHub publishes for the
 # release asset (best-effort supply-chain integrity on top of TLS). A genuine
 # mismatch ALWAYS aborts. When the tools to check are absent (no sha256sum/shasum,
 # or neither jq nor python3 to read the API, or the API is unreachable) it warns
-# and continues rather than breaking installs in minimal environments.
+# and continues rather than breaking installs in minimal environments -- unless
+# --require-checksum was passed, which makes that condition fatal.
 verify_checksum() {
     local file="$1" fname="$2" version="$3"
 
@@ -433,7 +466,7 @@ verify_checksum() {
         sha_tool="shasum -a 256"
     fi
     if [ -z "$sha_tool" ]; then
-        print_message warning "No sha256 tool (sha256sum/shasum) found; skipping checksum verification."
+        checksum_unverified "no sha256 tool (sha256sum/shasum) is available"
         return 0
     fi
 
@@ -457,7 +490,7 @@ except Exception:
         fi
     fi
     if [ -z "$expected" ]; then
-        print_message warning "Could not fetch the expected checksum for ${fname}; skipping verification."
+        checksum_unverified "the expected checksum for ${fname} could not be fetched (no jq/python3, or the GitHub API was unreachable or rate-limited)"
         return 0
     fi
 
@@ -473,12 +506,22 @@ except Exception:
 
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}DragonCode ${MUTED}version: ${NC}$specific_version"
-    local tmp_dir="${TMPDIR:-/tmp}/dragon_install_$$"
-    mkdir -p "$tmp_dir"
+    # mktemp, not "$$": the old ${TMPDIR:-/tmp}/dragon_install_$$ was predictable,
+    # and `mkdir -p` succeeds onto a pre-existing symlink-to-directory, so a local
+    # attacker who won the race chose where the archive was extracted.
+    local tmp_dir
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/dragon_install_XXXXXX")
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url" "$tmp_dir/$filename"; then
-        # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
-        curl -# -L -o "$tmp_dir/$filename" "$url"
+        # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails.
+        # -f so an HTTP error is an error: without it curl saves the error page as
+        # the archive and exits 0, and the install fails later with a tar/unzip
+        # message that describes the symptom and not the cause.
+        if ! curl -f -# -L -o "$tmp_dir/$filename" "$url"; then
+            print_message error "Failed to download ${filename} from ${url}"
+            rm -rf "$tmp_dir"
+            exit 1
+        fi
     fi
 
     # Integrity gate before we extract and run anything from the archive.
@@ -490,15 +533,76 @@ download_and_install() {
         unzip -q "$tmp_dir/$filename" -d "$tmp_dir"
     fi
 
-    mv "$tmp_dir/$bin_name" "${INSTALL_DIR}/${bin_name}"
-    chmod 755 "${INSTALL_DIR}/${bin_name}" 2>/dev/null || true
+    place_binary "$tmp_dir/$bin_name"
     rm -rf "$tmp_dir"
+}
+
+# Put a freshly-downloaded binary at its final path.
+#
+# The old code did a bare `mv` (download path) or `cp` (--binary path) straight
+# over the destination. Two ways that failed:
+#
+#  - ETXTBSY. $tmp_dir lives under $TMPDIR and $INSTALL_DIR under $HOME, which
+#    on Linux are routinely different filesystems, so `mv` degrades from
+#    rename(2) to copy-in-place -- and copying over a RUNNING executable fails
+#    with "Text file busy". That is exactly the self-upgrade path: `dragon
+#    upgrade` runs this installer while dragon is running. install.ps1 has
+#    always handled this (it renames the running image aside first); bash did
+#    not.
+#  - On macOS, writing over an existing signed binary invalidates the code
+#    signature and the process is then killed on launch with no message.
+#
+# Moving the old file aside first solves both: the destination becomes a fresh
+# inode, the running image keeps its own (unlinked) file until it exits, and the
+# signature travels with the new file rather than being spliced into the old one.
+place_binary() {
+    local src="$1"
+    local dest="${INSTALL_DIR}/${bin_name}"
+    local previous="${dest}.previous"
+
+    if [ -e "$dest" ]; then
+        rm -f "$previous" 2>/dev/null || true
+        # A rename within one directory is atomic and works even while the old
+        # binary is executing.
+        if ! mv -f "$dest" "$previous" 2>/dev/null; then
+            print_message error "Could not move the existing ${bin_name} aside at ${dest}"
+            exit 1
+        fi
+    fi
+
+    if ! mv -f "$src" "$dest" 2>/dev/null; then
+        # Cross-device: fall back to copy + rename into place, never a copy
+        # straight over $dest.
+        local staged="${dest}.new.$$"
+        if ! cp "$src" "$staged" || ! chmod 755 "$staged" || ! mv -f "$staged" "$dest"; then
+            rm -f "$staged" 2>/dev/null || true
+            # Put the old one back rather than leaving the user with nothing.
+            [ -e "$previous" ] && mv -f "$previous" "$dest" 2>/dev/null || true
+            print_message error "Failed to install ${bin_name} to ${dest}"
+            exit 1
+        fi
+    fi
+
+    # A failed chmod used to be swallowed with `|| true`, leaving a
+    # non-executable binary behind a success message.
+    if ! chmod 755 "$dest"; then
+        print_message error "Installed ${dest} but could not make it executable"
+        exit 1
+    fi
+
+    rm -f "$previous" 2>/dev/null || true
 }
 
 install_from_binary() {
     print_message info "\n${MUTED}Installing ${NC}DragonCode ${MUTED}from: ${NC}$binary_path"
-    cp "$binary_path" "${INSTALL_DIR}/${bin_name}"
-    chmod 755 "${INSTALL_DIR}/${bin_name}" 2>/dev/null || true
+    local staged
+    staged=$(mktemp "${TMPDIR:-/tmp}/dragon_local_XXXXXX")
+    if ! cp "$binary_path" "$staged"; then
+        rm -f "$staged" 2>/dev/null || true
+        print_message error "Could not read ${binary_path}"
+        exit 1
+    fi
+    place_binary "$staged"
 }
 
 if [ -n "$binary_path" ]; then
