@@ -637,32 +637,49 @@ add_to_path() {
 
 XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 
-current_shell=$(basename "$SHELL")
+# $SHELL is the LOGIN shell from passwd, not the shell running this script. In
+# containers and CI it is frequently /bin/sh while the user's real rc file is
+# .bashrc, which sent the PATH line to a file their shell never sources. Prefer
+# the parent process's actual shell and fall back to $SHELL.
+detect_shell() {
+    local parent name
+    parent=$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d ' ' || true)
+    name=$(basename "${parent#-}" 2>/dev/null || true)
+    case "$name" in
+        fish|zsh|bash|ash|dash|sh) echo "$name"; return 0 ;;
+    esac
+    basename "${SHELL:-sh}"
+}
+
+current_shell=$(detect_shell)
+
+# An ARRAY, not a space-separated string. This was previously one string split
+# by an unquoted `for file in $config_files`, so any space in $HOME, $ZDOTDIR or
+# $XDG_CONFIG_HOME -- "/Users/John Smith" -- shattered it into tokens that match
+# no file. The user then silently fell through to "No config file found" and
+# their PATH was never written.
 case $current_shell in
     fish)
-        config_files="$HOME/.config/fish/config.fish"
+        config_files=("$HOME/.config/fish/config.fish")
     ;;
     zsh)
-        config_files="${ZDOTDIR:-$HOME}/.zshrc ${ZDOTDIR:-$HOME}/.zshenv $XDG_CONFIG_HOME/zsh/.zshrc $XDG_CONFIG_HOME/zsh/.zshenv"
+        config_files=("${ZDOTDIR:-$HOME}/.zshrc" "${ZDOTDIR:-$HOME}/.zshenv" "$XDG_CONFIG_HOME/zsh/.zshrc" "$XDG_CONFIG_HOME/zsh/.zshenv")
     ;;
     bash)
-        config_files="$HOME/.bashrc $HOME/.bash_profile $HOME/.profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
+        config_files=("$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$XDG_CONFIG_HOME/bash/.bashrc" "$XDG_CONFIG_HOME/bash/.bash_profile")
     ;;
-    ash)
-        config_files="$HOME/.ashrc $HOME/.profile /etc/profile"
-    ;;
-    sh)
-        config_files="$HOME/.ashrc $HOME/.profile /etc/profile"
+    ash|dash|sh)
+        config_files=("$HOME/.ashrc" "$HOME/.profile" "/etc/profile")
     ;;
     *)
         # Default case if none of the above matches
-        config_files="$HOME/.bashrc $HOME/.bash_profile $XDG_CONFIG_HOME/bash/.bashrc $XDG_CONFIG_HOME/bash/.bash_profile"
+        config_files=("$HOME/.bashrc" "$HOME/.bash_profile" "$XDG_CONFIG_HOME/bash/.bashrc" "$XDG_CONFIG_HOME/bash/.bash_profile")
     ;;
 esac
 
 if [[ "$no_modify_path" != "true" ]]; then
     config_file=""
-    for file in $config_files; do
+    for file in "${config_files[@]}"; do
         if [[ -f $file ]]; then
             config_file=$file
             break
@@ -683,10 +700,7 @@ if [[ "$no_modify_path" != "true" ]]; then
             bash)
                 add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
             ;;
-            ash)
-                add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
-            ;;
-            sh)
+            ash|dash|sh)
                 add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH"
             ;;
             *)
@@ -698,9 +712,20 @@ if [[ "$no_modify_path" != "true" ]]; then
     fi
 fi
 
-if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" == "true" ]; then
-    echo "$INSTALL_DIR" >> $GITHUB_PATH
-    print_message info "Added $INSTALL_DIR to \$GITHUB_PATH"
+# GITHUB_ACTIONS was guarded defensively on the line above, then $GITHUB_PATH
+# was dereferenced bare on the next -- an unbound-variable abort under `set -u`
+# wherever GITHUB_ACTIONS=true is set without the file (act, some containers).
+# Unquoted, too, so a path with a space would have redirected to the wrong file.
+if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" = "true" ]; then
+    if [ -n "${GITHUB_PATH-}" ]; then
+        if echo "$INSTALL_DIR" >> "$GITHUB_PATH"; then
+            print_message info "Added $INSTALL_DIR to \$GITHUB_PATH"
+        else
+            print_message warning "Could not append $INSTALL_DIR to \$GITHUB_PATH ($GITHUB_PATH)"
+        fi
+    else
+        print_message warning "GITHUB_ACTIONS is set but \$GITHUB_PATH is not; skipping the PATH export."
+    fi
 fi
 
 echo -e ""
